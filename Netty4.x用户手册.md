@@ -1,4 +1,4 @@
-# 4.x用户手册
+# Netty 4.x用户手册
 
 ### 前言
 
@@ -195,3 +195,105 @@ public void channelRead(ChannelHandlerContext ctx,Object msg){
 当你再次运行*telnet*命令，你将看到服务器将返回一切你发送给它的内容。
 
 响应服务器的所有代码位于发布的 [`io.netty.example.echo`](http://netty.io/4.0/xref/io/netty/example/echo/package-summary.html) 包内。
+
+#### 编写一个时间服务器
+
+这一节要实现的协议是[`TIME`](http://tools.ietf.org/html/rfc868)。这与前面的例子不同。它发送了一个包含32位整数的信息，且不接收任何请求，并在信息发送完成后关闭连接。在这个例子里，你将学会如何组织并发送一个信息，然后在完成时关闭连接。
+
+由于我们打算忽略任何接收的数据，并且在连接创建时立刻发送一个信息，这次我们不能使用`channelRead()`方法。取而代之，我们需要重写`channelActive()`方法。实现如下：
+
+```java
+package io.netty.example.time;
+public class TimeServerHandler extends ChannelInboundHandlerAdapter{
+  @Override
+  public void channelActive(final channelHandlerContext ctx){ //(1)
+    final ByteBuf time = ctx.alloc().buffer(4); //(2)
+    time.writeInt((int)(System.currentTimeMillis()/1000L+2208988800L));
+    final ChannelFuture f=ctx.writeAndFlush(time); //(3)
+    f.addListener(new ChannelFutureListener(){
+      @Override
+      public void operationComplete(ChannelFuture future){
+        assert f==future;
+        ctx.close();
+      }
+    }); //(4)
+  }
+  @Override
+  public void exceptionCaught(ChannelHandlerContext ctx,Throwable cause){
+    cause.printStackTrace();
+    ctx.close();
+  }
+}
+```
+
+1. 不言而喻，`channelActive()`方法将在连接创建时被激活，准备产生流量。让我们在这个方法中写入一个32位整数来代表当前时间。
+
+2. 为了发送新的信息，我们需要分配一个新的缓冲区来保存。32位整数需要一个容量为4个字节的[`ByteBuf`](http://netty.io/4.0/api/io/netty/buffer/ByteBuf.html)，通过`ChannelHandlerContext.alloc()`获取当前的[`ByteBufAllocator`](http://netty.io/4.0/api/io/netty/buffer/ByteBufAllocator.html)并分配一个新的缓冲区。
+
+3. 像往常一样，我们来写信息的构造。
+
+   但是请等一下，flip在哪儿？难道在NIO中，发送信息之前不应该调用`java.nio.ByteBuffer.flip()`么？`ByteBuf`并不包含这个方法，因为它有两个指针。一个指向读操作，另一个是写操作。当你向`ByteBuf`写什么东西的时候，写指针地址索引将会增长，读指针不变。读写地址索引分别代表了信息的开始与结束。
+
+   相反，如果没有flip方法，NIO缓冲区并没有提供一个简便的方式来辨别信息内容的开始和结束。如果你忘记flip缓冲区将会陷入麻烦，因为空或者错误的数据将被发送。这样的错误不会在Netty中发生，因为对于不同的操作类型，我们有不同的指针。当你习惯与此你会发现这让你的日子更好过了——没有flip out的日子!
+
+   另一个需要知道的点是`ChannelHandlerContext.write()`（以及`writeAndFlush()`）方法返回一个 [`ChannelFuture`](http://netty.io/4.0/api/io/netty/channel/ChannelFuture.html)。一个 [`ChannelFuture`](http://netty.io/4.0/api/io/netty/channel/ChannelFuture.html)代表一个尚未发生的I/O操作。这意味着，任何请求操作可能都还没有执行，因为Netty中所有操作都是异步的。例如，下面这段代码可能会在信息发送前就关闭了连接：
+
+   ```java
+   Channel ch=...;
+   ch.writeAndFlush(message);
+   ch.close();
+   ```
+
+   因此，你需要在`write()`返回的[`ChannelFuture`](http://netty.io/4.0/api/io/netty/channel/ChannelFuture.html)完成以后调用`close()`方法。它将会在写操作完成后通知监听者。请注意，`close()`也可能不会立刻关闭连接，并且它返回一个[`ChannelFuture`](http://netty.io/4.0/api/io/netty/channel/ChannelFuture.html)。
+
+4. 那当请求完成后，我们如何获得通知呢？很简单，只需要在返回的`ChannelFuture`上添加一个 [`ChannelFutureListener`](http://netty.io/4.0/api/io/netty/channel/ChannelFutureListener.html)。这里，我们创建了一个新的异步 [`ChannelFutureListener`](http://netty.io/4.0/api/io/netty/channel/ChannelFutureListener.html)来在操作结束时关闭通道。
+
+   另一种选择，是使用预定义的监听器来简化代码：
+
+   ```java
+   f.addListener(ChannelFutureListener.CLOSE);
+   ```
+
+为了测试我们的时间服务器像预期的那样工作，可以使用UNIX的`rdate`命令：
+
+```shell
+$ rdate -o <port> -p <host>
+```
+
+`<port>`是你在`main()`方法中定义的端口号，`<host>`一般是`localhost`。
+
+#### 编写一个时间客户端
+
+与`DISCARD`和`ECHO`服务器不同，我们需要为`TIME`协议准备一个客户端，因为人无法手工将32位二进制数据转换为日历上的一个日期。在这一节，我们讨论如何确保服务端正确的工作，并学习如何用Netty写一个客户端。
+
+Netty关于服务端和客户端最大和唯一的区别在于使用了不同的[`Bootstrap`](http://netty.io/4.0/api/io/netty/bootstrap/Bootstrap.html) 和[`Channel`](http://netty.io/4.0/api/io/netty/channel/Channel.html)实现。请看一下下面的代码：
+
+```java
+package io.netty.example.time;
+public class TimeClient{
+  public static void main(String[] args) throws Exception{
+    String host=args[0];
+    int port=Integer.parseInt(args[1]);
+    EventLoopGroup workerGroup=new NioEventLoopGroup();
+    try{
+      Bootstrap b=new Bootstrap(); //(1)
+      b.group(workerGoup); //(2)
+      b.channel(NioSocketChannel.class); //(3)
+      b.option(ChannelOption.SO_KEEPALIVE,true); //(4)
+      b.handler(new ChannelInitializer<SocketChannel>(){
+        @Override
+        public void initChannel(SocketChannel ch) throws Exception{
+          ch.pipeline().addLast(new TimeClientHandler());
+        }
+      });
+      //启动客户端
+      ChannelFuture f=b.connect(host,port).sync(); //(5)
+      //在连接关闭之前保持等待
+      f.channel().closeFuture().sync();
+    }finally{
+      workerGroup.shutdownGracefully();
+    }
+  }
+}
+```
+
