@@ -297,3 +297,96 @@ public class TimeClient{
 }
 ```
 
+1. [`Bootstrap`](http://netty.io/4.0/api/io/netty/bootstrap/Bootstrap.html)与 [`ServerBootstrap`](http://netty.io/4.0/api/io/netty/bootstrap/ServerBootstrap.html) 类似，只不过它用于非服务端通道，如客户端或无连接通道。
+2. 如果你只指定了一个 [`EventLoopGroup`](http://netty.io/4.0/api/io/netty/channel/EventLoopGroup.html)，它将既做工头也做工人。尽管工头并不用于客户端。
+3.  [`NioSocketChannel`](http://netty.io/4.0/api/io/netty/channel/socket/nio/NioSocketChannel.html) 用来创建一个客户端的通道，而不是 [`NioServerSocketChannel`](http://netty.io/4.0/api/io/netty/channel/socket/nio/NioServerSocketChannel.html)。
+4. 注意这里我们没有使用`childOption()`，因为客户端的 [`SocketChannel`](http://netty.io/4.0/api/io/netty/channel/socket/SocketChannel.html) 没有父类。
+5. 我们应当调用`connect()`方法而非`bind()`方法。
+
+如你所见，这与服务端代码不尽相同。那么[`ChannelHandler`](http://netty.io/4.0/api/io/netty/channel/ChannelHandler.html) 实现又怎样呢？他应该从服务器接收32位整数，并翻译成人工可读格式，打印翻译的时间，关闭连接：
+
+```java
+package io.netty.example.time;
+import java.util.Date;
+public class TimeClientHandler extends ChannelInboundHandlerAdapter {
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) {
+        ByteBuf m = (ByteBuf) msg; // (1)
+        try {
+            long currentTimeMillis = (m.readUnsignedInt() - 2208988800L) * 1000L;
+            System.out.println(new Date(currentTimeMillis));
+            ctx.close();
+        } finally {
+            m.release();
+        }
+    }
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+        cause.printStackTrace();
+        ctx.close();
+    }
+}
+```
+
+1. 在TCP/IP中，Netty从对等端读取数据到一个 [`ByteBuf`](http://netty.io/4.0/api/io/netty/buffer/ByteBuf.html)。
+
+这看起来很简单，与服务端的示例没有什么大不同。然而，这个处理器有时候会拒绝工作并发出一个`IndexOutOfBoundsExcepiton`。在下一节我们来讨论为什么这个会发生。
+
+#### 处理基于流的传输
+
+##### 关于套接字缓冲区的一个小注意事项
+
+在基于流传输如TCP/IP中，接收的数据存储在一个套接字缓冲区中。不幸的是，这个流传输缓冲区并非是一个包的队列，而是一个字节队列。意思是说，即便你发送了两个独立包的信息，操作系统并不会把它们当做两条信息，而是当做一堆字节。因此无法保证你所读的内容就是远程另一端所写的内容。例如，假定一个操作系统的TCP/IP栈接收到了三个包：
+
+`ABC` `DEF` `GHI` 
+
+由于基于流协议的一般属性，在你的应用里有很大概率读取为如下的片段形式：
+
+`AB` `CDEFG` `H` `I`
+
+因此，在接收的部分，不论是服务端还是客户端，都应该将接收到的数据分割成一个或者多个有意义的帧，以便能够被应用逻辑方便的理解。如上面这个例子，接收的数据应该封装成为下面这样的帧：
+
+`ABC` `DEF` `GHI`
+
+##### 第一个方案
+
+现在，让我们返回`TIME`客户端这个例子。这里有同样的问题。一个32位整数是一个很小量的数据，并且它不可能经常被碎片化。然而，问题是它可以被碎片化，并且随着流量的提高，碎片化的可能性也会提高。
+
+最简单的办法是创建一个内部的累积缓冲区，等待所有4字节被放进来。如下是一个修改后的`TimeClientHandler`，解决了这个问题：
+
+```java
+package io.netty.example.time;
+import java.util.Date;
+public class TimeClientHandler extends ChannelInboundHandlerAdapter {
+    private ByteBuf buf;
+    @Override
+    public void handlerAdded(ChannelHandlerContext ctx) {
+        buf = ctx.alloc().buffer(4); // (1)
+    }
+    @Override
+    public void handlerRemoved(ChannelHandlerContext ctx) {
+        buf.release(); // (1)
+        buf = null;
+    }
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) {
+        ByteBuf m = (ByteBuf) msg;
+        buf.writeBytes(m); // (2)
+        m.release();
+        if (buf.readableBytes() >= 4) { // (3)
+            long currentTimeMillis = (buf.readUnsignedInt() - 2208988800L) * 1000L;
+            System.out.println(new Date(currentTimeMillis));
+            ctx.close();
+        }
+    }
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+        cause.printStackTrace();
+        ctx.close();
+    }
+}
+```
+
+1. 一个 [`ChannelHandler`](http://netty.io/4.0/api/io/netty/channel/ChannelHandler.html) 有两个生命周期监听器方法：`handlerAdded()`和`handlerRemoved()`。你可以执行任意一个初始化（反初始化）任务，只要它没有长时间阻塞。
+2. 首先，所有接收的数据都应该积累到`buf`中。
+3. 然后，这个处理器必须检查`buf`是否包含了足够的数据，这个例子里是4个字节，然后再进行真正的业务逻辑。当有更多数据到达时，Netty将会再次调用`channelRead()`方法，最终将累积所有4个字节。
