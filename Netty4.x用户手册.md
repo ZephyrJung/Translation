@@ -299,7 +299,7 @@ public class TimeClient{
 
 1. [`Bootstrap`](http://netty.io/4.0/api/io/netty/bootstrap/Bootstrap.html)与 [`ServerBootstrap`](http://netty.io/4.0/api/io/netty/bootstrap/ServerBootstrap.html) 类似，只不过它用于非服务端通道，如客户端或无连接通道。
 2. 如果你只指定了一个 [`EventLoopGroup`](http://netty.io/4.0/api/io/netty/channel/EventLoopGroup.html)，它将既做工头也做工人。尽管工头并不用于客户端。
-3.  [`NioSocketChannel`](http://netty.io/4.0/api/io/netty/channel/socket/nio/NioSocketChannel.html) 用来创建一个客户端的通道，而不是 [`NioServerSocketChannel`](http://netty.io/4.0/api/io/netty/channel/socket/nio/NioServerSocketChannel.html)。
+3. [`NioSocketChannel`](http://netty.io/4.0/api/io/netty/channel/socket/nio/NioSocketChannel.html) 用来创建一个客户端的通道，而不是 [`NioServerSocketChannel`](http://netty.io/4.0/api/io/netty/channel/socket/nio/NioServerSocketChannel.html)。
 4. 注意这里我们没有使用`childOption()`，因为客户端的 [`SocketChannel`](http://netty.io/4.0/api/io/netty/channel/socket/SocketChannel.html) 没有父类。
 5. 我们应当调用`connect()`方法而非`bind()`方法。
 
@@ -390,3 +390,168 @@ public class TimeClientHandler extends ChannelInboundHandlerAdapter {
 1. 一个 [`ChannelHandler`](http://netty.io/4.0/api/io/netty/channel/ChannelHandler.html) 有两个生命周期监听器方法：`handlerAdded()`和`handlerRemoved()`。你可以执行任意一个初始化（反初始化）任务，只要它没有长时间阻塞。
 2. 首先，所有接收的数据都应该积累到`buf`中。
 3. 然后，这个处理器必须检查`buf`是否包含了足够的数据，这个例子里是4个字节，然后再进行真正的业务逻辑。当有更多数据到达时，Netty将会再次调用`channelRead()`方法，最终将累积所有4个字节。
+
+##### 第二个方案
+
+虽然第一个方案解决了`TIME`客户端的问题，但是修改后的处理器看起来不甚简洁。想象一个更复杂的协议，融合了如变量长度的多个字段。你的 [`ChannelInboundHandler`](http://netty.io/4.0/api/io/netty/channel/ChannelInboundHandler.html) 实现将很快变得无法维护。
+
+你可能已经注意到了，你可以在[`ChannelPipeline`](http://netty.io/4.0/api/io/netty/channel/ChannelPipeline.html)上添加不止一个 [`ChannelHandler`](http://netty.io/4.0/api/io/netty/channel/ChannelHandler.html) ，因此，你可以将单个的 [`ChannelHandler`](http://netty.io/4.0/api/io/netty/channel/ChannelHandler.html) 划分成多个模块，来降低你应用的复杂度。例如，你可以将`TimeClientHandler`划分成两个处理器：
+
+- `TimeDecoder`用来处理碎片问题，以及
+- 初始化`TimeClientHandler`的简单版本
+
+幸运的是，Netty提供了一个可扩展的类来帮你写出第一个东西：
+
+```java
+package io.netty.example.time;
+public class TimeDecoder extends ByteToMessageDecoder { // (1)
+    @Override
+    protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) { // (2)
+        if (in.readableBytes() < 4) {
+            return; // (3)
+        }
+        out.add(in.readBytes(4)); // (4)
+    }
+}
+```
+
+1. [`ByteToMessageDecoder`](http://netty.io/4.0/api/io/netty/handler/codec/ByteToMessageDecoder.html) 是 [`ChannelInboundHandler`](http://netty.io/4.0/api/io/netty/channel/ChannelInboundHandler.html) 的一个实现，它使得处理碎片问题变得更容易了。
+2. [`ByteToMessageDecoder`](http://netty.io/4.0/api/io/netty/handler/codec/ByteToMessageDecoder.html) 调用了`decode()`方法，这个方法内部维护了一个累积缓冲区来接收任何新来的数据。
+3. `decode()`能够决定在没有累积缓冲区足够的数据时不向`out`添加内容。 [`ByteToMessageDecoder`](http://netty.io/4.0/api/io/netty/handler/codec/ByteToMessageDecoder.html) 将会在更多数据接收时再次调用`decode()`。
+4. 如果`decode()`向`out`添加了一个对象，这意味着解码器成功的解码了一个信息。 [`ByteToMessageDecoder`](http://netty.io/4.0/api/io/netty/handler/codec/ByteToMessageDecoder.html) 将会放弃读取部分累计缓冲区。请记住你没有必要解码多个信息。[`ByteToMessageDecoder`](http://netty.io/4.0/api/io/netty/handler/codec/ByteToMessageDecoder.html) 将会持续调用`decode()`方法直到没有可向`out`添加的内容为止。
+
+现在我们有另一个处理器添加到 [`ChannelPipeline`](http://netty.io/4.0/api/io/netty/channel/ChannelPipeline.html) 中，我们需要修改`TimeClient`中的 [`ChannelInitializer`](http://netty.io/4.0/api/io/netty/channel/ChannelInitializer.html) 实现：
+
+```java
+b.handler(new ChannelInitializer<SocketChannel>() {
+    @Override
+    public void initChannel(SocketChannel ch) throws Exception {
+        ch.pipeline().addLast(new TimeDecoder(), new TimeClientHandler());
+    }
+});
+```
+
+如果你乐于冒险，可以尝试使用 [`ReplayingDecoder`](http://netty.io/4.0/api/io/netty/handler/codec/ReplayingDecoder.html) 让解码器进一步简化。当然，你需要查询API手册来获取更多信息。
+
+```java
+public class TimeDecoder extends ReplayingDecoder<Void> {
+    @Override
+    protected void decode(
+      	ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
+        out.add(in.readBytes(4));
+    }
+}
+```
+
+另外，Netty提供了开箱即用的解码器，可以让你很容易的实现大多数协议，帮你避免以单个无法维护的处理器实现告终。请查看下面的包中的例子来获取更多细节：
+
+- [`io.netty.example.factorial`](http://netty.io/4.0/xref/io/netty/example/factorial/package-summary.html) 二进制协议
+- [`io.netty.example.telnet`](http://netty.io/4.0/xref/io/netty/example/telnet/package-summary.html) 文本行协议
+
+#### 用POJO说话而非`ByteBuf`
+
+目前我们所看到的代码都是用 [`ByteBuf`](http://netty.io/4.0/api/io/netty/buffer/ByteBuf.html) 作为协议信息的主要数据结构。在这一节，我们将升级`TIME`协议的客户端和服务端例子，使用POJO而不是 [`ByteBuf`](http://netty.io/4.0/api/io/netty/buffer/ByteBuf.html)。
+
+在 [`ChannelHandler`](http://netty.io/4.0/api/io/netty/channel/ChannelHandler.html) 中使用POJO的有点显而易见。你的处理器将更容易维护，即从`ByteBuf`抽取的信息能够被分离的代码重用。在`TIME`客户端和服务端的例子中，我们只读取了32位整数，而直接使用`ByteBuf`并不是主要问题。然而，当你实现一个现实世界中的协议时，你会发现做分离是很有必要的。
+
+首先，让我们定义一个新的类型，名为`UnixTime`。
+
+```java
+package io.netty.example.time;
+import java.util.Date;
+public class UnixTime {
+    private final long value;
+    public UnixTime() {
+        this(System.currentTimeMillis() / 1000L + 2208988800L);
+    }
+    public UnixTime(long value) {
+        this.value = value;
+    }
+    public long value() {
+        return value;
+    }
+    @Override
+    public String toString() {
+        return new Date((value() - 2208988800L) * 1000L).toString();
+    }
+}
+```
+
+现在我们可以修改`TimeDecoder`来产生一个`UnixTime`而非 [`ByteBuf`](http://netty.io/4.0/api/io/netty/buffer/ByteBuf.html)。
+
+```java
+@Override
+protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
+    if (in.readableBytes() < 4) {
+        return;
+    }
+    out.add(new UnixTime(in.readUnsignedInt()));
+}
+```
+
+使用了新的解码器，`TimeClientHandler`将不再使用 [`ByteBuf`](http://netty.io/4.0/api/io/netty/buffer/ByteBuf.html) ：
+
+```java
+@Override
+public void channelRead(ChannelHandlerContext ctx, Object msg) {
+    UnixTime m = (UnixTime) msg;
+    System.out.println(m);
+    ctx.close();
+}
+```
+
+更简单优雅了，对么？同样的技术将应用在服务端。这次让我们更新一下`TimeServerHandler`：
+
+```java
+@Override
+public void channelActive(ChannelHandlerContext ctx) {
+    ChannelFuture f = ctx.writeAndFlush(new UnixTime());
+    f.addListener(ChannelFutureListener.CLOSE);
+}
+```
+
+现在，唯一缺少的部分就是编码器了，它是 [`ChannelOutboundHandler`](http://netty.io/4.0/api/io/netty/channel/ChannelOutboundHandler.html) 的一个实现，将`UnixTime`翻译回一个 [`ByteBuf`](http://netty.io/4.0/api/io/netty/buffer/ByteBuf.html) 。这比写一个解码器容易得多，因为在对信息编码时不需要处理数据包分片和组装。
+
+```java
+package io.netty.example.time;
+public class TimeEncoder extends ChannelOutboundHandlerAdapter {
+    @Override
+    public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
+        UnixTime m = (UnixTime) msg;
+        ByteBuf encoded = ctx.alloc().buffer(4);
+        encoded.writeInt((int)m.value());
+        ctx.write(encoded, promise); // (1)
+    }
+}
+```
+
+1. 这一行有几个重要的地方：
+
+   首先，我们传递了一个原生态 [`ChannelPromise`](http://netty.io/4.0/api/io/netty/channel/ChannelPromise.html) ，当编码后的数据实际向线上写出时，Netty标记它为成功或者失败。
+
+   其次，我们不调用`ctx.flush()`。这里有一个处理器方法`void flush(ChannelHandlerContext ctx)`，它的目的就是重写`flush()`操作。
+
+为了更进一步简化，你可以使用 [`MessageToByteEncoder`](http://netty.io/4.0/api/io/netty/handler/codec/MessageToByteEncoder.html)：
+
+```java
+public class TimeEncoder extends MessageToByteEncoder<UnixTime> {
+    @Override
+    protected void encode(ChannelHandlerContext ctx, UnixTime msg, ByteBuf out) {
+        out.writeInt((int)msg.value());
+    }
+}
+```
+
+最后一个剩下的任务是将`TimeEncoder`在`TimeServerHandler`之前插入到服务端的 [`ChannelPipeline`](http://netty.io/4.0/api/io/netty/channel/ChannelPipeline.html) ，这作为一个练习任务略过。
+
+#### 关闭应用
+
+关闭一个Netty应用通常和使用`shutdownGracefully()`关闭所有你创建的[`EventLoopGroup`](http://netty.io/4.0/api/io/netty/channel/EventLoopGroup.html)一样简单。它返回一个 [`Future`](http://netty.io/4.0/api/io/netty/util/concurrent/Future.html) 来告诉你 [`EventLoopGroup`](http://netty.io/4.0/api/io/netty/channel/EventLoopGroup.html) 何时完全终止，以及所有属于这个组的[`Channel`](http://netty.io/4.0/api/io/netty/channel/Channel.html)都已经关闭。
+
+#### 总结
+
+在本篇文章中，我们使用一个关于如何基于Netty写一个完全工作的网络应用的展示进行了一次快速的Netty之旅。
+
+即将到来的篇章中将包含关于Netty的更多章节，我们鼓励你复读 [`io.netty.example`](https://github.com/netty/netty/tree/4.0/example/src/main/java/io/netty/example) 包下的Netty示例。
+
+同时请知道 [the community](http://netty.io/community.html) 永远在等待你的问题和反馈来帮助提高Netty及其文档。
