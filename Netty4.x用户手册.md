@@ -206,7 +206,7 @@ public void channelRead(ChannelHandlerContext ctx,Object msg){
 package io.netty.example.time;
 public class TimeServerHandler extends ChannelInboundHandlerAdapter{
   @Override
-  public void channelActive(final channelHandlerContext ctx){ //(1)
+  public void channelActive(final ChannelHandlerContext ctx){ //(1)
     final ByteBuf time = ctx.alloc().buffer(4); //(2)
     time.writeInt((int)(System.currentTimeMillis()/1000L+2208988800L));
     final ChannelFuture f=ctx.writeAndFlush(time); //(3)
@@ -277,7 +277,7 @@ public class TimeClient{
     EventLoopGroup workerGroup=new NioEventLoopGroup();
     try{
       Bootstrap b=new Bootstrap(); //(1)
-      b.group(workerGoup); //(2)
+      b.group(workerGroup); //(2)
       b.channel(NioSocketChannel.class); //(3)
       b.option(ChannelOption.SO_KEEPALIVE,true); //(4)
       b.handler(new ChannelInitializer<SocketChannel>(){
