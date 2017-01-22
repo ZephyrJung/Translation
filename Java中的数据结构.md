@@ -193,3 +193,11 @@ List除了继承Collection接口所指定的方法之外，添加了部分重载
 ## Set extends Collection
 
 Set的方法没有新增的，官方定义Set为不包含重复元素的Collection。
+
+## Queue extends Colletion
+
+该接口只重写了Collection的add(E)方法，其余皆为新增：
+
+- `boolean offer(E e)`
+
+   
